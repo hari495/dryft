@@ -378,7 +378,7 @@ step < 50 µs when graphs are on.
   (`[layers, num_blocks, block=16, kv_heads, hd]` + block-table tensor)
   so any (B, L) fits one pool without recapture. Paged is v2; static
   rows are v1. (Implemented: `engine/dryft_qwen3/cache.py`.)
-- Per-sequence `seq_lens: int32[B_max]` on device. Every kernel reads
+- Per-sequence `seq_lens: int64[B_max]` on device (int64 so it doubles as a torch index tensor). Every kernel reads
   lengths from this tensor — never from Python ints — so one CUDA graph
   serves all positions.
 - Fixed device buffers for: current input ids `[B_max, Kmax+1]`,
