@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -63,6 +64,20 @@ def snapshot_and_push(branch: str, message: str) -> str:
     git("push", "-q", "origin", f"{commit}:refs/heads/{branch}")
     print(f"[official_run] pushed {commit[:10]} -> origin/{branch} (parent {parent[:10]})", file=sys.stderr)
     return commit
+
+
+def default_message() -> str:
+    """``autoresearch: <HEAD> (+dirty) FLAGS: A=1 B=0`` — the flag set is the
+    experiment's identity when the tree is pushed uncommitted."""
+    head = git("rev-parse", "--short", "HEAD")
+    dirty = "+dirty" if git("status", "--porcelain", "--", "engine") else ""
+    flags = []
+    with open(os.path.join(REPO, "engine", "dryft_qwen3", "config.py"), encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r'\s*"([A-Z_]+)":\s*(True|False),', line)
+            if m:
+                flags.append(f"{m.group(1)}={int(m.group(2) == 'True')}")
+    return f"autoresearch: {head}{dirty} FLAGS: {' '.join(flags)}"
 
 
 def find_run(api: Dryft, commit: str, timeout: float) -> dict:
@@ -181,7 +196,7 @@ def main() -> int:
             return 1
         run = wait_run(api, items[0]["id"], args.timeout)
     else:
-        message = args.message or os.environ.get("AUTORESEARCH_DESC") or f"autoresearch: {git('log', '-1', '--format=%s')}"
+        message = args.message or os.environ.get("AUTORESEARCH_DESC") or default_message()
         commit = snapshot_and_push(args.branch, message)
         run = find_run(api, commit, timeout=300)
         run = wait_run(api, run["id"], args.timeout)

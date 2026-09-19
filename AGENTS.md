@@ -54,9 +54,14 @@ Appendix B. Reading list
 7. Every change passes `python agent/verify.py --all` (correctness) and
    `python agent/bench.py --gate` (latency/stability) before commit to
    `main`. `./bin/dryft validate engine` must also pass.
-8. `main` = submission branch. Work on `dev`. Merge to `main` only for a
-   deliberate official run. Auto-run-on-push is OFF; runs are started
-   with explicit intent (each takes tens of minutes plus queue).
+8. `main` = the connected branch: every push to it starts an **official,
+   ranked** run (the platform offers no public mode this round and no
+   local H100 exists, so the official run IS the benchmark). A worse run
+   never lowers the team's best score; the only cost is a 10–15 min GPU
+   slot. Therefore: `./autoresearch.sh` is the one way to push — it
+   gates on CPU verify + platform lint first — and each run must answer
+   one deliberate, batched question (e.g. "all Tier-2 kernels on"),
+   bisecting only on failure. Never push `main` by hand mid-edit.
 9. Peak GPU memory < 64 GB (self-imposed; hard limit is 72 GB = 90 % of
    80 GB).
 10. Log every experiment in `agent/experiments.md` (Section 15), even
@@ -196,6 +201,47 @@ Decode at M = batch ≤ 32 is memory-bound for every GEMM (H100 ridge
 ≈ 300 FLOP/byte; even M ≈ 100 during speculative verify is below it).
 Prefill at M = B×L ≥ 512 is compute-bound: use cuBLAS + flash SDPA.
 
+### 4.1 Measured (official run d2b0b294, commit 0fb3a60, 2026-09-19)
+
+H100 80GB HBM3 (SXM, 3.35 TB/s), gVisor sandbox, harness 0.2.0. Torch
+decode path with CUDA graphs + pipelined yield; all `TRITON_*` flags off.
+**Score 405** (hidden geomean, native = 100). Leaders: 633, 624, then ~300.
+
+| Workload      | ours tok/s | native | total ms | TTFT ms (×native) | TPOT ms (×native) | achieved BW |
+|---------------|-----------:|-------:|---------:|------------------:|------------------:|------------:|
+| b1 ×512 ×32   |    104     |   40   |   306    |  23 (0.81×)       |  9.15 (0.36×)     |  0.88 TB/s  |
+| b4 ×2048 ×32  |    206     |  123   |   621    | 214 (1.06×)       | 13.17 (0.49×)     |  0.61 TB/s  |
+| b16 ×512 ×128 |   1338     |  521   |  1531    | 202 (1.05×)       | 10.45 (0.36×)     |  0.91 TB/s  |
+
+Spread < 1 % everywhere; peak 49.2 GiB. All 9 workloads correct.
+
+What the numbers say:
+- **TPOT is 3–4× off the floor** (2.4 ms at b1; ~2.9 ms at b16 incl. KV
+  reads). At ~55 torch kernels/layer ≈ 2000 kernels/step, even inside a
+  graph each ~3–4 µs kernel costs more than the bytes it moves. This is
+  the launch/fusion-bound regime of §4: Tier 2 + 3 fusion is worth
+  ~2–2.5× on TPOT and, since hidden workloads are decode-heavy (405 ≫
+  the public geomean speedup of 2.2×), roughly the same on the score.
+- **b4 ×2048 decode is 4 ms/step slower than b1** with the same weights:
+  that is the masked-SDPA decode path over the padded `[.., :3072]`
+  bucket (mask build + math/efficient backend at q_len 1 + strided KV
+  reads). The split-KV Triton kernel reads `seq_lens + 1` keys and
+  removes the length-bucket dependence entirely.
+- **TTFT is the gate nearest failure (1.06× of 1.10×)** on both
+  prefill-heavy shapes. Our prefill ≈ HF's because both are unfused:
+  per layer, RMSNorm ×2 (~8 passes over `[T, 2560]`), q/k-norm + RoPE
+  (~14 passes over `[T, 4096]`), `silu(g)*u` (3 passes over
+  `[T, 9728]`) ≈ 3–4 GB of elementwise traffic per layer at T = 8192,
+  ≈ 35–40 ms of the 214 ms. Running the Tier-2 kernels in prefill too
+  should give TTFT ≈ 0.85–0.9× and buys real headroom under the gate.
+- Prefill GEMMs at T = 8192 are ~50 % of peak tensor throughput; that is
+  cuBLAS territory and not worth touching before Tier 5.
+
+Targets after Tier 2 + 3 (same workloads): TPOT ≈ 4 ms → b1 ≈ 220 tok/s,
+b4 ×2048 ≈ 400, b16 ≈ 3000; projected score ≈ 800–900, i.e. clear of the
+current 633. Speculation (Tier 5) is then the moat: it is the only
+technique that beats the 2.4 ms/step floor.
+
 ---------------------------------------------------------------------------
 ## 5. Repository layout
 
@@ -244,54 +290,65 @@ Keep `engine/` free of anything that isn't imported at runtime.
 ---------------------------------------------------------------------------
 ## 6. Workflow — the loop
 
+The bench is the platform (no local GPU; official runs only). Each
+iteration costs one 10–15 min run, so each run answers one batched
+question, and everything that can fail cheaply fails locally first.
+
 Each iteration:
-1. Pick the highest-ranked unblocked item from Section 10 (or from the
-   ledger's "next" list). One technique per iteration.
-2. Implement behind a flag in `engine/dryft_qwen3/config.py` (`FLAGS = {...}`) so
-   it can be A/B'd in one process and disabled instantly if it
-   regresses.
-3. `python agent/verify.py --all` → must be 100 % token match on all
-   prompt sets; min logit margin reported.
-4. `python agent/bench.py --public --extra` → per-workload tok/s, TTFT,
-   TPOT, spread, peak mem, achieved BW. Compare against the previous
-   best in the ledger.
-5. Keep iff: geomean(public) improves ≥ 1 % AND no workload's TTFT or
-   TPOT regresses > 5 % AND local spread < 15 % AND peak mem < 64 GB.
-   Otherwise flip the flag off, record the result, move on.
-6. Commit to `dev` with message `[<area>] <what> : <geomean before→after>`.
-7. Every N kept changes (or when a tier completes): `./bin/dryft
-   validate engine`, merge to `main`, start ONE official run, record
-   hidden scores in the ledger next to local numbers. Calibrate
-   local→official.
+1. Pick the highest-ranked unblocked item from Section 10 (or the
+   ledger's "next" list). Batch what can be batched into one run: a
+   *set* of flags whose failure modes are distinguishable from the
+   report (e.g. wrong tokens vs slower TPOT vs init crash).
+2. Implement behind a flag in `engine/dryft_qwen3/config.py:FLAGS` so a
+   regression is one line to revert. Kernels ship with a torch
+   reference and a `selftest()`; `Engine.__init__` must run every
+   enabled kernel's selftest on the GPU and **fall back to the torch
+   path** if one fails — a wrong kernel must never fail a workload,
+   because the first time any Triton kernel executes on a GPU *is* an
+   official run (T2.0 below wires this; nothing else ships before it).
+3. Local gates (seconds): `python agent/verify.py --tiny --all` (CPU
+   exact-match vs HF on a random tiny Qwen3 — Triton paths are
+   *not* exercised here), `./bin/dryft validate engine`.
+4. `./autoresearch.sh` → snapshots the working tree onto `origin/main`,
+   waits, prints `METRIC score=…` plus public tok/s, TTFT/TPOT ratios,
+   spread, peak memory (`agent/official_run.py`). Engine stderr is
+   hidden on official runs: any diagnostic you need must be encoded in
+   *timing* (e.g. a fallback makes TPOT identical to the previous run).
+5. Keep iff: score improves AND TTFT/TPOT ratios stay ≤ 1.0 with ≥ 5 %
+   headroom under the 1.10 gate AND spread < 10 % AND peak < 64 GB.
+   Otherwise flip the flag off, record, move on. Two consecutive runs
+   of the same engine differ by < 2 % (noise sample in the ledger);
+   treat smaller deltas as noise.
+6. Record every run in `agent/experiments.md` (Section 15) with the run
+   id. Commit to the working branch with `[<area>] <what> : <score
+   before→after>`.
 
 Commands:
 ```
-python agent/verify.py --all --model $CKPT       # correctness gate (real checkpoint)
-python agent/verify.py --tiny --all              # same gate on a random tiny Qwen3, CPU-only
-python agent/verify.py --kernels                 # per-kernel unit tests (CUDA + triton)
-python agent/bench.py --baseline --model $CKPT   # time the starter once -> agent/baseline.json
-python agent/bench.py --public --extra           # timing (+ ours/baseline gate ratios)
-python agent/bench.py --gate                     # pass/fail summary only
-python agent/profiler.py --workload b1_512_32 --steps 8 --eager  # kernel table
-python agent/tune.py --all                       # regenerate engine/tuned/*.json (not yet written)
-./bin/dryft validate engine                      # server lint, locally
-./bin/dryft run <SUBMISSION_ID> --wait 3000      # rerun a submission
+./autoresearch.sh                                 # gates + ONE official run (the bench)
+python agent/official_run.py --run-id <RUN_ID>    # re-print a finished run's metrics
+python agent/verify.py --tiny --all               # CPU exact-match gate on a random tiny Qwen3
+python agent/verify.py --all --model $CKPT        # same gate on the real checkpoint (needs a GPU)
+python agent/verify.py --kernels                  # per-kernel unit tests (needs CUDA + triton)
+python agent/bench.py --public --extra            # local timing (needs a GPU)
+python agent/profiler.py --workload b1_512_32 --steps 8 --eager  # kernel table (needs a GPU)
+./bin/dryft validate engine                       # platform lint, locally
+./bin/dryft runs | ./bin/dryft result <RUN_ID>    # run history / full report
 ```
-Platform facts (2026-09-19): the API moved to `https://htn.dryft.ai`
-(export `DRYFT_API=https://htn.dryft.ai` for CLI 0.1.0). CLI upload
-(`dryft submit`) returns 405 — submissions are created only from a repo
-connected at https://htn.dryft.ai/repos (GitHub App; engine folder
-`engine`); a push to the connected branch starts a *public* run.
+Platform facts (2026-09-19): API at `https://htn.dryft.ai` (`.env` holds
+`DRYFT_API` + `DRYFT_TOKEN`; gitignored). CLI upload (`dryft submit`)
+returns 405 and `POST …/runs` rejects `mode != official` (422):
+submissions exist only through the connected repo `hari495/dryft`
+(branch `main`, engine folder `engine`), and every push is an official
+ranked run. A newer push cancels a still-queued older run. Runs have a
+15 min limit once a runner picks them up (9 workloads × (our init +
+native load + 2×5 samples) fit in ~10 min today; init must stay
+< 40 s/workload). Round ends 2026-09-20T12:00Z.
 Local dev environment: `uv venv --python 3.11 .venv && uv pip install
 --python .venv/bin/python torch==2.5.1 transformers==4.51.3
-safetensors==0.5.3 tokenizers==0.21.1 "numpy<2.2"`; run the commands above
-with `.venv/bin/python`. `--flag NAME=0|1` on verify/bench overrides
-`engine/dryft_qwen3/config.py:FLAGS` for A/B runs.
-If no local H100: still run verify on whatever GPU exists (correctness
-is GPU-agnostic; kernel tuning is not); batch several changes per
-official run; keep changes flag-gated so a bad one can be turned off
-without re-engineering; compare official per-workload numbers between
-runs as your bench.
+safetensors==0.5.3 tokenizers==0.21.1 "numpy<2.2"`; run the commands
+above with `.venv/bin/python`. `--flag NAME=0|1` on verify/bench
+overrides `FLAGS` for A/B runs.
 
 ---------------------------------------------------------------------------
 ## 7. Verification protocol (`agent/verify.py`)
@@ -491,6 +548,50 @@ Python hasn't read.
 
 Legend — Gain: expected effect on geomean vs previous tier. Each item
 lists its acceptance test.
+
+### Status (2026-09-19) and the next runs, in order
+
+Done: Tier 0 (tooling), Tier 1 (own forward, static cache, graphs,
+pipelined yield, fused prefill GEMMs) → score 405. Written but never
+executed on a GPU: `kernels/rmsnorm.py`, `kernels/rope_qknorm.py`,
+`kernels/attn_decode.py` (flags off). Not started: Tier 4, Tier 5.
+
+Run plan (one official run each; ~12 min; bisect only on failure):
+
+| # | Batch pushed | Reads from the report | Expected |
+|---|---|---|---|
+| R1 | **T2.0** selftest-or-fallback in `__init__` for every Triton kernel; `TRITON_RMSNORM=1` (decode + prefill) | correct; TPOT ↓ ≈ 1 ms/step at b1 (−14 kernels/layer); TTFT b4×2048 ↓ ≈ 10 ms. If TPOT unchanged → kernel fell back → bisect its selftest tolerance | b1 ≈ 118, score ≈ 450 |
+| R2 | `TRITON_ROPE=1` (decode + prefill; writes K/V in the kernel) | TPOT ↓ ≈ 1.5 ms (−20 kernels/layer); TTFT ↓ ≈ 15 ms | score ≈ 520 |
+| R3 | `TRITON_ATTN_DECODE=1` (split-KV, reads `seq_lens+1` keys) | b4×2048 TPOT 13.2 → ≈ 9 ms; all TPOT ↓ (−4 kernels/layer, no mask build) | score ≈ 580 |
+| R4 | **T2.3** `silu*mul` fused kernel (prefill + decode) + **T2.4** o/down GEMM epilogue-adds via Triton split-K GEMM for M ≤ 32 (`kernels/gemm_splitk.py`), or plain torch `addmm` into the residual if the GEMM kernel isn't ready | kernels/layer → ~8; TPOT → ≈ 5 ms | score ≈ 700 |
+| R5 | **T4.1** cuBLAS-vs-split-K dispatch for the four decode GEMMs at M ∈ {1,2,4,8,16,32}: measure *inside* `__init__` on the real GPU (torch.cuda.Event timing, < 2 s total) and pick per shape — this is the only autotune we can do without a local GPU; it happens before the timed region and is allowed (rule 5) | TPOT → ≈ 4 ms at b1 | score ≈ 800 |
+| R6 | **T5.1** PLD chain drafting, k = 3, with 5.7's guard; needs q_len = 1+k graphs and `attn_verify` (chain = causal over `[n, n]`, so the split-KV kernel with q_len > 1 suffices) | tokens/step ↑ on copy-heavy hidden prompts; TPOT ratio must stay ≤ 1.0; spread ≤ 10 % | +10–40 % where prompts repeat |
+| R7 | **T5.2** Token Recycling tree (n ≈ 16–24 nodes), then **5.3** hybrid | uniform ≈ 1.3–1.6× at b ≤ 8; less at b16–32 | +20–40 % |
+
+Research notes behind the ordering (2025 literature; details in
+Appendix A.4/A.7):
+- Fusion first: at ~2000 kernels/step the GPU is idle most of the step.
+  Every kernel removed at M = 1 is worth ≈ 3–4 µs × 36 layers; the
+  Tier-2/3 set removes ~45 kernels/layer ≈ 5–6 ms/step. No speculation
+  scheme pays that well.
+- Skinny GEMMs: published Triton split-K results on H100 at M ≤ 16 are
+  1.2–1.9× over data-parallel Triton and up to ~1.7–1.9× over cuBLAS
+  *FP8/FP16 GEMM*; plain cuBLAS bf16 GEMV at M = 1 is already ~70 % of
+  peak, so expect ≤ 1.2× on `down_proj` (K = 9728) and `o_proj`, and
+  measure before shipping (R5). GEMV-style (no `tl.dot`) wins at M = 1.
+- Training-free speculation, Spec-Bench numbers (Vicuna/Llama, greedy):
+  PLD mean accepted tokens ≈ 1.7–1.8 (1.5–1.7× speedup) on general
+  text, up to 3.2 on code/edits; Token Recycling ≈ 2.7–2.8 (≈ 2×,
+  uniform across tasks, < 2 MB state); SuffixDecoding ≈ 6–8 only on
+  agentic traces with long repeats. Hidden prompts are unknown, so TR's
+  uniformity matters more than PLD's peak; PLD first because it is ~40
+  lines and needs only chain verify.
+- Verify cost: at M = B·(1+k) ≤ ~128 every GEMM is still memory-bound,
+  so a verify step ≈ 1.05–1.3× a decode step; attention grows with
+  (1+k) query rows but reads the same K/V once per kv head.
+- Prefill: TTFT is 1.05–1.06× native and the gate is 1.10. R1–R4 also
+  run in prefill and should bring it to ≈ 0.85×; nothing else touches
+  prefill until Tier 5 is stable.
 
 ### Tier 0 — Instrument (day 0)
 - Run starter unchanged; record baseline tok/s, TTFT, TPOT per public
@@ -771,27 +872,34 @@ official numbers.
 
 1. How is TPOT computed: (total − TTFT)/(out − 1), or max/mean of
    inter-yield gaps? (Determines speculation chain limits.)
-   ANSWER: ______
+   ANSWER (from report v2): `tpotMs` is consistent with (total − TTFT)/
+   (out − 1): b1 306 ms, TTFT 23, TPOT 9.15 × 31 = 284. Not asked.
 2. How is timing spread computed: (max − min)/median over total time?
-   ANSWER: ______
+   ANSWER: report exposes p10/p50/p90/mean/stddev over 5 samples; the
+   gate text says "spread across the five samples ≤ 25 %". Not asked.
 3. Are prompt lengths equal within a hidden batch? Are hidden prompts
    natural text or synthetic/random ids? (Decides whether PLD is worth
    building.)
    ANSWER: ______
 4. Is there a warmup call before the 5 timed samples, at the workload
    shape?
-   ANSWER: ______
+   ANSWER: yes — `warmupIterations: 1` in every shape's report.
 5. Which attention implementation / generate flags does the baseline
    use (eager vs sdpa)? Is the baseline the unmodified starter engine?
-   ANSWER: ______
+   ANSWER: report has `referenceMs/referenceTtftMs/referenceTpotMs`
+   from "native Qwen" timed in the same container; starter uses
+   `attn_implementation="sdpa"`, `use_cache=True`, `logits_to_keep=1`.
 6. Is peak memory measured via torch allocator or device-level
    (nvidia-smi)?
-   ANSWER: ______
+   ANSWER: `peakMemoryBytes` = 52 830 994 432 on every shape, identical
+   to the byte, so it is the allocator's reserved peak (our static
+   buffers), not a device sample. Budget stays 64 GB.
 7. Are `torch.compile`-generated Triton kernels acceptable (compiled
    at runtime, not shipped)?
    ANSWER: ______
 8. Is the GPU an H100 SXM (3.35 TB/s) or PCIe (2.0 TB/s)?
-   ANSWER: ______
+   ANSWER: `deviceName: NVIDIA H100 80GB HBM3` (SXM), driver 580.95,
+   gVisor sandbox (`Linux-4.19.0-gvisor`), Python 3.11.5.
 
 ---------------------------------------------------------------------------
 ## 17. Don'ts (quick reference)
@@ -867,6 +975,36 @@ every callable before capture and never autotune at runtime. Side
 streams inside capture must be joined via `wait_stream` in both
 directions. Graph replays require all inputs to be the same tensors
 written in place.
+
+A.7 What the 2025 literature adds (surveyed 2026-09-19, after run 1).
+- Training-free speculation, greedy, Spec-Bench (Vicuna/Llama class,
+  H100): Prompt Lookup MAT ≈ 1.7–1.8 → 1.5–1.7× (summarization/RAG
+  best, conversation/translation worst); Token Recycling (Luo et al.,
+  arXiv 2408.08696, ACL 2025) MAT ≈ 2.7–2.8 → ≈ 2.0–2.1×, the best pure
+  train-free method on mixed tasks, < 2 MB state, tree of ~60 nodes in
+  the paper (use 16–32 here: our verify overhead is larger on a 4B
+  model); SuffixDecoding (Oliaro et al., arXiv 2411.04975, NeurIPS
+  2025) MAT 6–8 but only on agentic traces with long verbatim repeats —
+  irrelevant unless hidden prompts turn out copy-heavy; SAM-Decoding +
+  TR ≈ 2.3× (arXiv 2411.10666). Hybrids (PLD spine + TR branches) are
+  consistently ≥ either alone. Reported speedups are batch-1; at b = 16–
+  32 the verify GEMMs approach the compute ridge and gains shrink, so
+  cap the per-sequence node budget by batch bucket (5.7).
+- Skinny GEMM on H100 (Meta/IBM arXiv 2402.00025; PyTorch blogs on
+  Llama-3 FP8 TK-GEMM and MoE GEMMs): split-K ≈ 8 is the sweet spot at
+  M ≤ 16; gains vs data-parallel Triton 1.2–1.9×, vs cuBLAS 1.1–1.9×
+  depending on dtype (largest for FP8/W4, smallest for plain bf16 where
+  cuBLAS GEMV already runs ~70 % of HBM peak). Hopper wgmma pads M to 64
+  rows, so at M = 1 a `tl.dot` kernel wastes ~98 % of its MMA fill —
+  prefer broadcast-multiply + `tl.sum` (GEMV style) for M ≤ 4 and let
+  the tile loop stream weights. Lesson for us: measure per shape in
+  `__init__`, keep cuBLAS wherever it wins, fuse the residual add into
+  whichever kernel wins.
+- Overhead: with graphs on, the residual cost is per-kernel execution
+  tail (~2–4 µs) not launch latency; at ~2000 kernels/step that is most
+  of our 9 ms. This is why fusion (Tier 2/3) outranks everything else
+  on the roadmap, and why a persistent per-layer kernel (Tier 6) is the
+  eventual end state if Tiers 2–5 leave headroom.
 
 ---------------------------------------------------------------------------
 ## Appendix B. Reading list (study these; do not copy code that isn't

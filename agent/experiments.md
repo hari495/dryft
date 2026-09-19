@@ -95,3 +95,13 @@ next: (1) TTFT hygiene above; (2) verify.py --kernels on GPU is impossible from
 here -> enable TRITON_RMSNORM alone in one push and read the result (a wrong
 kernel fails correctness; a broken launch fails init); (3) then TRITON_ROPE,
 TRITON_ATTN_DECODE.
+
+### 2026-09-19  [official run d12c4e80] commit 07d4783 (same engine as 0fb3a60)   NOISE SAMPLE
+harness: first end-to-end `./autoresearch.sh` run (CPU verify -> lint -> push main -> wait).
+score: 399.2 vs 405.0 for the identical engine -> run-to-run noise ~1.5 % on score.
+public: b1 102.4 (was 104.4), b4x2048 202.5 (206.2), b16 1319 (1338): -1..-2 %.
+native reference moved more than we did: b16 total 3428 ms vs 3931 ms (-13 %),
+so the TPOT *ratio* at b16 read 0.42x vs 0.36x with our TPOT within 2 %.
+=> gate ratios carry ~10-15 % noise from the native side; keep TTFT <= 1.0x
+   by design, not by margin. Deltas < 2 % on score are noise.
+timing: leased 08:13:35, measuring 08:14:06, done 08:23:14 -> 9.1 min on the runner.

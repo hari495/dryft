@@ -7,8 +7,8 @@ i.e. normalise in fp32, round to bf16, THEN multiply by the weight and round
 once more. Reference implementations in torch live beside each kernel; run
 ``selftest()`` (``python agent/verify.py --kernels``) on the target GPU.
 
-STATUS: written without hardware access; FLAGS["TRITON_RMSNORM"] stays off
-until selftest passes on an H100.
+STATUS: enabled (R1); selftest runs in Model.__init__ on the target GPU and
+the torch path is used if it fails.
 """
 
 from __future__ import annotations
@@ -39,15 +39,41 @@ def _add_rmsnorm_kernel(
     tl.store(y_ptr + offs, (normed * w).to(tl.bfloat16), mask=mask)
 
 
+@triton.jit
+def _rmsnorm_rows_kernel(
+    x_ptr, w_ptr, y_ptr,
+    n_rows, n_cols, eps,
+    R: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """R rows per program; for narrow rows (per-head q/k norm, n = 128)."""
+    pid = tl.program_id(0)
+    rows = pid * R + tl.arange(0, R)
+    cols = tl.arange(0, BLOCK)
+    mask = (rows[:, None] < n_rows) & (cols[None, :] < n_cols)
+    offs = rows[:, None].to(tl.int64) * n_cols + cols[None, :]
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / n_cols
+    normed = (x * tl.math.rsqrt(var + eps)[:, None]).to(tl.bfloat16).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=cols < n_cols, other=0.0).to(tl.float32)
+    tl.store(y_ptr + offs, (normed * w[None, :]).to(tl.bfloat16), mask=mask)
+
+
+ROWS_PER_PROGRAM = 16  # for n_cols <= 256
+
+
 def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """``[M, H]`` bf16 -> ``[M, H]`` bf16; matches ``Qwen3RMSNorm``."""
+    """``[..., H]`` bf16 -> same shape bf16; matches ``Qwen3RMSNorm``."""
     x2 = x.contiguous().view(-1, x.shape[-1])
     y = torch.empty_like(x2)
     rows, n = x2.shape
     block = triton.next_power_of_2(n)
-    _add_rmsnorm_kernel[(rows,)](
-        x2, x2, w, x2, y, n, eps, HAS_X=False, BLOCK=block, num_warps=8 if block >= 2048 else 4
-    )
+    if n <= 256:
+        grid = (triton.cdiv(rows, ROWS_PER_PROGRAM),)
+        _rmsnorm_rows_kernel[grid](x2, w, y, rows, n, eps, R=ROWS_PER_PROGRAM, BLOCK=block, num_warps=4)
+    else:
+        _add_rmsnorm_kernel[(rows,)](
+            x2, x2, w, x2, y, n, eps, HAS_X=False, BLOCK=block, num_warps=8 if block >= 2048 else 4
+        )
     return y.view(x.shape)
 
 
@@ -79,16 +105,28 @@ def add_rmsnorm_ref(res, x, w, eps):
 
 def selftest(device: str = "cuda") -> None:
     torch.manual_seed(0)
-    for rows, n in ((1, 2560), (32, 2560), (5, 128), (16, 16), (7, 4096)):
+    tol = 2 * 2**-8  # one bf16 ulp of slack, relative to the largest output
+    # Shapes the model uses (hidden 2560 rows; 128-wide head rows) plus odd
+    # row counts for masking. Each distinct (kernel, BLOCK) costs a compile
+    # at load, so stay on the production BLOCK sizes.
+    shapes = ((1, 2560), (32, 2560), (7, 2560), (8192, 2560), (1, 128), (5, 128), (33, 128), (1000, 128))
+    for rows, n in shapes:
         res = (torch.randn(rows, n, device=device) * 3).to(torch.bfloat16)
         x = torch.randn(rows, n, device=device).to(torch.bfloat16)
         w = (1 + 0.1 * torch.randn(n, device=device)).to(torch.bfloat16)
         y = rmsnorm(res, w, 1e-6)
         y_ref = rmsnorm_ref(res, w, 1e-6)
-        assert torch.equal(y, y_ref) or (y.float() - y_ref.float()).abs().max() <= 2 * 2**-8 * y_ref.float().abs().max(), \
-            f"rmsnorm mismatch rows={rows} n={n}: {(y.float() - y_ref.float()).abs().max()}"
-        r2, y2 = add_rmsnorm(res, x, w, 1e-6)
-        r_ref, y2_ref = add_rmsnorm_ref(res, x, w, 1e-6)
-        assert torch.equal(r2, r_ref), f"residual add mismatch rows={rows} n={n}"
-        assert (y2.float() - y2_ref.float()).abs().max() <= 2 * 2**-8 * y2_ref.float().abs().max(), \
-            f"add_rmsnorm mismatch rows={rows} n={n}"
+        err = (y.float() - y_ref.float()).abs().max().item()
+        assert err <= tol * y_ref.float().abs().max().item(), f"rmsnorm mismatch rows={rows} n={n}: {err}"
+        if n > 256:  # add_rmsnorm only ever sees the hidden width
+            r2, y2 = add_rmsnorm(res, x, w, 1e-6)
+            r_ref, y2_ref = add_rmsnorm_ref(res, x, w, 1e-6)
+            assert torch.equal(r2, r_ref), f"residual add mismatch rows={rows} n={n}"
+            err = (y2.float() - y2_ref.float()).abs().max().item()
+            assert err <= tol * y2_ref.float().abs().max().item(), f"add_rmsnorm mismatch rows={rows} n={n}: {err}"
+    # strided input (a q slice out of the fused qkv row) must be handled by the wrapper
+    qkv = torch.randn(4, 6144, device=device).to(torch.bfloat16)
+    w = torch.ones(128, device=device, dtype=torch.bfloat16)
+    q = qkv[:, :4096].view(4, 32, 128)
+    y, y_ref = rmsnorm(q, w, 1e-6).float(), rmsnorm_ref(q, w, 1e-6).float()
+    assert (y - y_ref).abs().max().item() <= tol * y_ref.abs().max().item(), "strided q slice"

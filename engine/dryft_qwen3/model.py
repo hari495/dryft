@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from .cache import DecodeState
-from .config import ModelConfig, flag, has_triton
+from .config import ModelConfig, flag, has_triton, log
 from .weights import Weights
 
 
@@ -60,13 +60,31 @@ class Model:
         self.scale = 1.0 / math.sqrt(cfg.head_dim)
         self.rope_len = rope_len
         self.cos, self.sin = rope_tables(cfg, rope_len, device)
-        self.triton = has_triton()
-        if self.triton and (flag("TRITON_RMSNORM") or flag("TRITON_ROPE") or flag("TRITON_ATTN_DECODE")):
-            from .kernels import attn_decode as _attn, rmsnorm as _rms, rope_qknorm as _rope
+        self.triton = has_triton() and device.type == "cuda"
+        # Each Triton kernel earns its place at load time: selftest on this GPU
+        # or the torch path is used for it. Official runs hide stderr and one
+        # wrong token fails a workload, so a kernel that cannot prove itself
+        # here never runs (AGENTS.md section 6, step 2).
+        self._k_rms = self._load_kernel("TRITON_RMSNORM", "rmsnorm")
+        self._k_rope = self._load_kernel("TRITON_ROPE", "rope_qknorm")
+        self._k_attn = self._load_kernel("TRITON_ATTN_DECODE", "attn_decode")
 
-            self._k_rms, self._k_rope, self._k_attn = _rms, _rope, _attn
-        else:
-            self._k_rms = self._k_rope = self._k_attn = None
+    def _load_kernel(self, flag_name: str, module_name: str):
+        if not (self.triton and flag(flag_name)):
+            return None
+        import importlib
+        import time
+
+        t0 = time.time()
+        try:
+            mod = importlib.import_module(f".kernels.{module_name}", __package__)
+            mod.selftest(str(self.device))
+            torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - any failure means "use torch"
+            log(f"warning: {module_name} selftest FAILED in {time.time() - t0:.1f}s; torch path for {flag_name}: {exc!r}")
+            return None
+        log(f"{module_name}: selftest ok in {time.time() - t0:.1f}s")
+        return mod
 
     # ------------------------------------------------------------------ prefill
     @torch.no_grad()
@@ -81,14 +99,24 @@ class Model:
         cos = state.cos[:T][None, None]  # [1, 1, T, D]
         sin = state.sin[:T][None, None]
         use_gqa = flag("PREFILL_ENABLE_GQA")
-        for li, L in enumerate(self.w.layers):
-            h = rmsnorm(x, L.w_in, cfg.eps)
+        tri_rms = self._k_rms
+        norm = tri_rms.rmsnorm if tri_rms is not None else rmsnorm
+
+        def add_norm(res: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if tri_rms is not None:
+                return tri_rms.add_rmsnorm(res, y, w, cfg.eps)
+            r = res + y
+            return r, rmsnorm(r, w, cfg.eps)
+
+        layers = self.w.layers
+        h = norm(x, layers[0].w_in, cfg.eps)
+        for li, L in enumerate(layers):
             qkv = F.linear(h, L.w_qkv)  # [B, T, Hq + 2 Hkv]
             q = qkv[..., :Hq].view(B, T, nH, D)
             k = qkv[..., Hq : Hq + Hkv].view(B, T, nKV, D)
             v = qkv[..., Hq + Hkv :].view(B, T, nKV, D)
-            q = rmsnorm(q, L.w_qn, cfg.eps).transpose(1, 2)  # [B, nH, T, D]
-            k = rmsnorm(k, L.w_kn, cfg.eps).transpose(1, 2)  # [B, nKV, T, D]
+            q = norm(q, L.w_qn, cfg.eps).transpose(1, 2)  # [B, nH, T, D]
+            k = norm(k, L.w_kn, cfg.eps).transpose(1, 2)  # [B, nKV, T, D]
             v = v.transpose(1, 2)
             q = rope(q, cos, sin)
             k = rope(k, cos, sin)
@@ -105,12 +133,15 @@ class Model:
                     q.contiguous(), k32.contiguous(), v32.contiguous(), is_causal=True, scale=self.scale
                 )
             o = o.transpose(1, 2).reshape(B, T, Hq)
-            x = x + F.linear(o, L.w_o)
-            h = rmsnorm(x, L.w_post, cfg.eps)
+            x, h = add_norm(x, F.linear(o, L.w_o), L.w_post)
             gu = F.linear(h, L.w_gu)
             g, u = gu.split(I, dim=-1)
-            x = x + F.linear(F.silu(g) * u, L.w_down)
-        last = rmsnorm(x[:, -1], self.w.norm, cfg.eps)  # [B, H]
+            mlp = F.linear(F.silu(g) * u, L.w_down)
+            if li + 1 < len(layers):
+                x, h = add_norm(x, mlp, layers[li + 1].w_in)
+            else:
+                x = x + mlp
+        last = norm(x[:, -1], self.w.norm, cfg.eps)  # [B, H]
         logits = F.linear(last, self.w.lm_head)
         return logits.argmax(dim=-1)
 
@@ -139,9 +170,8 @@ class Model:
         rows = state.row_idx[:Bb]
         layers = self.w.layers
         eps = cfg.eps
-        tri_rms = self._k_rms if (self._k_rms is not None and flag("TRITON_RMSNORM")) else None
-        tri_rope = self._k_rope if (self._k_rope is not None and flag("TRITON_ROPE")) else None
-        tri_attn = self._k_attn if (self._k_attn is not None and flag("TRITON_ATTN_DECODE")) else None
+        tri_rms, tri_rope, tri_attn = self._k_rms, self._k_rope, self._k_attn
+        norm = tri_rms.rmsnorm if tri_rms is not None else rmsnorm
 
         def add_norm(res: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """(res + y, rmsnorm(res + y) * w): the residual add and the norm
@@ -152,7 +182,7 @@ class Model:
             return r, rmsnorm(r, w, eps)
 
         x = F.embedding(ids, self.w.embed)  # [Bb, H] residual stream
-        h = tri_rms.rmsnorm(x, layers[0].w_in, eps) if tri_rms is not None else rmsnorm(x, layers[0].w_in, eps)
+        h = norm(x, layers[0].w_in, eps)
         if tri_rope is None:
             cos = state.cos[pos][:, None, :]  # [Bb, 1, D]
             sin = state.sin[pos][:, None, :]
@@ -169,8 +199,8 @@ class Model:
                     state.k_cache[li], state.v_cache[li], eps, nH, nKV, D,
                 )
             else:
-                q = rmsnorm(qkv[:, :Hq].view(Bb, nH, D), L.w_qn, eps)
-                k = rmsnorm(qkv[:, Hq : Hq + Hkv].view(Bb, nKV, D), L.w_kn, eps)
+                q = norm(qkv[:, :Hq].view(Bb, nH, D), L.w_qn, eps)
+                k = norm(qkv[:, Hq : Hq + Hkv].view(Bb, nKV, D), L.w_kn, eps)
                 v = qkv[:, Hq + Hkv :].view(Bb, nKV, D)
                 q = rope(q, cos, sin)
                 k = rope(k, cos, sin)

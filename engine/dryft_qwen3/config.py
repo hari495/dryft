@@ -28,9 +28,10 @@ FLAGS: dict[str, bool] = {
     # Prefill: pass enable_gqa=True to SDPA instead of materialising 32 K/V
     # heads. Off = bit-identical to the HF path.
     "PREFILL_ENABLE_GQA": False,
-    # Triton kernels (Tier 2/3). UNVERIFIED on hardware at the time of writing;
-    # keep off until `python agent/verify.py --kernels` passes on an H100.
-    "TRITON_RMSNORM": False,
+    # Triton kernels (Tier 2/3). Each enabled kernel selftests on the GPU in
+    # Model.__init__ and silently falls back to the torch path if it fails.
+    # R1 (2026-09-19): fused residual+RMSNorm on, decode and prefill.
+    "TRITON_RMSNORM": True,
     "TRITON_ROPE": False,
     "TRITON_ATTN_DECODE": False,
 }
