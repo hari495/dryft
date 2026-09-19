@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 
@@ -25,6 +25,10 @@ FLAGS: dict[str, bool] = {
     # Keep one decode step in flight; D2H copies land in a pinned ring and the
     # host waits on an event for step t-1 only.
     "PIPELINE": True,
+    # Speculative decoding by on-device prompt lookup (chain verify). Needs the
+    # Triton rope + attention kernels on CUDA; falls back to plain decode
+    # otherwise. Guarded per generation by measured tokens/step.
+    "SPECULATE": True,
     # Prefill: pass enable_gqa=True to SDPA (flash backend, K/V read straight
     # from the cache views) instead of materialising 32 K/V heads. Model.__init__
     # probes that flash really takes the GQA call and otherwise repeats K/V.
@@ -159,11 +163,22 @@ class Settings:
     # Static KV capacity. 32 x 8192 tokens x 147 KB = 37.7 GB.
     b_max: int = 32
     l_max: int = 8192
-    # Decode graphs are captured per (batch bucket, length bucket). A request
-    # picks the smallest bucket >= its need; anything larger takes the eager
-    # fallback with a dynamically allocated cache.
+    # Graphs are captured per (batch bucket, length bucket, chain length). A
+    # request picks the smallest bucket >= its need; anything larger takes the
+    # eager fallback with a dynamically allocated cache. The split-KV kernel
+    # reads only seq_lens+1 keys, so the length bucket only bounds masks and
+    # scratch: coarse buckets cost nothing at runtime and keep capture short.
     batch_buckets: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
-    len_buckets: tuple[int, ...] = (256, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+    len_buckets: tuple[int, ...] = (512, 1024, 2048, 4096, 8192)
+    # Speculation: drafts per sequence (chain length QL = 1 + drafts), by batch
+    # bucket. 0 disables. Verify rows = Bb * QL must stay memory-bound.
+    spec_drafts: dict[int, int] = field(default_factory=lambda: {1: 4, 2: 4, 4: 4, 8: 4, 16: 3, 32: 2})
+    # Guard: after `spec_window` speculative steps, keep speculating only if
+    # the mean tokens/step (over rows still generating) exceeds the measured
+    # verify/decode step-time ratio by this factor; otherwise the generation
+    # continues on the QL=1 graph.
+    spec_window: int = 6
+    spec_margin: float = 1.05
     # Pinned host ring for the pipelined yield loop.
     ring_depth: int = 4
     # cuBLAS warmup M values for prefill GEMMs.

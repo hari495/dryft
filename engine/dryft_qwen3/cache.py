@@ -17,6 +17,9 @@ import torch
 from .config import ModelConfig
 
 
+MAX_QL = 8  # longest chain (1 + drafts) the buffers are sized for
+
+
 class DecodeState:
     def __init__(
         self,
@@ -48,10 +51,21 @@ class DecodeState:
         self.row_idx = torch.arange(b_cap, dtype=torch.int64, device=device)
         self.head_idx = torch.arange(cfg.num_kv_heads, dtype=torch.int64, device=device)
         self.pos_range = torch.arange(l_cap, dtype=torch.int64, device=device)
+        # --- speculation (chain verify) state ---
+        # hist[b, p] = token at position p (prompt, then everything generated);
+        # the tail past l_cap is a scratch region invalid scatters land in.
+        self.hist = torch.zeros((b_cap, l_cap + 2 * MAX_QL + 2), dtype=torch.int64, device=device)
+        self.produced = torch.zeros(b_cap, dtype=torch.int64, device=device)  # tokens emitted incl. prefill's
+        self.max_new = torch.zeros((), dtype=torch.int64, device=device)
+        self.tok_in = torch.zeros((b_cap, MAX_QL), dtype=torch.int64, device=device)  # [last token, drafts...]
+        self.out_step = torch.full((b_cap, MAX_QL), -1, dtype=torch.int64, device=device)  # new tokens, -1 = none
+        self.n_new = torch.zeros(b_cap, dtype=torch.int64, device=device)
         self.pinned = pinned
         self.ring: torch.Tensor | None = None
+        self.ring_spec: torch.Tensor | None = None
         if pinned:
             self.ring = torch.zeros((ring_depth, b_cap), dtype=torch.int64, pin_memory=True)
+            self.ring_spec = torch.zeros((ring_depth, b_cap, MAX_QL), dtype=torch.int64, pin_memory=True)
 
     def bytes(self) -> int:
         return 2 * self.k_cache.numel() * self.k_cache.element_size()
@@ -61,3 +75,7 @@ class DecodeState:
         self.seq_lens[:b].zero_()
         self.ids[:b].zero_()
         self.next_ids[:b].zero_()
+        self.produced[:b].zero_()
+        self.tok_in[:b].zero_()
+        self.out_step[:b].fill_(-1)
+        self.hist[:b].zero_()

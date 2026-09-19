@@ -61,12 +61,12 @@ def _qknorm_rope_kv_kernel(
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     d = tl.arange(0, D // 2)
+    brow = row // T
+    t = row % T
     if PREFILL:
-        brow = row // T
-        pos = row % T
-    else:
-        brow = row
-        pos = tl.load(pos_ptr + row).to(tl.int64)
+        pos = t
+    else:  # chain row t of sequence brow sits at pos[brow] + t (T = 1: plain decode)
+        pos = tl.load(pos_ptr + brow).to(tl.int64) + t
     c = tl.load(cos_ptr + pos * D + d).to(tl.float32)
     s = tl.load(sin_ptr + pos * D + d).to(tl.float32)
     base = qkv_ptr + row * stride_qkv_row
@@ -77,7 +77,7 @@ def _qknorm_rope_kv_kernel(
         w1 = tl.load(wq_ptr + d).to(tl.float32)
         w2 = tl.load(wq_ptr + D // 2 + d).to(tl.float32)
         o1, o2 = _norm_rope(x1, x2, w1, w2, c, s, eps, D)
-        dst = q_out_ptr + brow * stride_qo_b + head * stride_qo_h + pos * stride_qo_t
+        dst = q_out_ptr + brow * stride_qo_b + head * stride_qo_h + t * stride_qo_t
         tl.store(dst + d, o1.to(tl.bfloat16))
         tl.store(dst + D // 2 + d, o2.to(tl.bfloat16))
     else:
@@ -102,21 +102,24 @@ def _qknorm_rope_kv_kernel(
 def qknorm_rope_kvwrite(
     qkv: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     pos: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, eps: float, nH: int, nKV: int, D: int,
+    QL: int = 1,
 ) -> torch.Tensor:
-    """Decode: qkv ``[M, (nH+2nKV)*D]`` bf16; pos int64 ``[M]``; k/v_cache
-    ``[B_cap, nKV, L_cap, D]`` (any strides, D contiguous). Returns rotated q
-    ``[M, nH, D]`` bf16 and writes k/v for row ``m`` at ``[m, :, pos[m], :]``."""
+    """Decode / chain verify: qkv ``[B * QL, (nH+2nKV)*D]`` bf16 with row
+    ``b * QL + j`` = chain position ``j`` of sequence ``b``; pos int64 ``[B]``
+    = position of chain token 0; k/v_cache ``[B_cap, nKV, L_cap, D]`` (any
+    strides, D contiguous). Returns rotated q ``[B * QL, nH, D]`` bf16 and
+    writes k/v of row ``(b, j)`` at ``[b, :, pos[b] + j, :]``."""
     M = qkv.shape[0]
     assert qkv.stride(1) == 1 and cos.is_contiguous() and sin.is_contiguous()
-    assert k_cache.stride(3) == 1 and v_cache.stride(3) == 1
+    assert k_cache.stride(3) == 1 and v_cache.stride(3) == 1 and M % QL == 0
     q_out = torch.empty((M, nH, D), dtype=torch.bfloat16, device=qkv.device)
     _qknorm_rope_kv_kernel[(M, nH + nKV)](
         qkv, wq, wk, cos, sin, pos, q_out, k_cache, v_cache,
         qkv.stride(0),
-        q_out.stride(0), q_out.stride(1), 0,
+        q_out.stride(0) * QL, q_out.stride(1), q_out.stride(0),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        eps, 0, NH=nH, NKV=nKV, D=D, PREFILL=False, num_warps=1,
+        eps, QL, NH=nH, NKV=nKV, D=D, PREFILL=False, num_warps=1,
     )
     return q_out
 
@@ -168,7 +171,11 @@ def reference(qkv, wq, wk, cos, sin, pos, nH, nKV, D, eps):
 
 def selftest(device: str = "cuda") -> None:
     torch.manual_seed(0)
-    for (M, nH, nKV, D, Lcap) in ((1, 32, 8, 128, 512), (16, 32, 8, 128, 2048), (32, 32, 8, 128, 8192)):  # production constexpr set only
+    for (B, QL, nH, nKV, D, Lcap) in (
+        (1, 1, 32, 8, 128, 512), (16, 1, 32, 8, 128, 2048), (32, 1, 32, 8, 128, 8192),
+        (1, 5, 32, 8, 128, 512), (7, 5, 32, 8, 128, 2048),
+    ):  # production constexpr set only
+        M = B * QL
         qkv = (torch.randn(M, (nH + 2 * nKV) * D, device=device) * 2).to(torch.bfloat16)
         wq = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)
         wk = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)
@@ -176,18 +183,19 @@ def selftest(device: str = "cuda") -> None:
         fr = torch.arange(Lcap, device=device).float()[:, None] * inv[None]
         emb = torch.cat((fr, fr), -1)
         cos, sin = emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)
-        pos = torch.randint(0, Lcap, (M,), device=device, dtype=torch.int64)
-        kc = torch.zeros((M + 2, nKV, Lcap, D), dtype=torch.bfloat16, device=device)
+        pos_b = torch.randint(0, Lcap - QL, (B,), device=device, dtype=torch.int64)
+        pos = (pos_b[:, None] + torch.arange(QL, device=device)[None, :]).reshape(-1)  # per row
+        kc = torch.zeros((B + 2, nKV, Lcap, D), dtype=torch.bfloat16, device=device)
         vc = torch.zeros_like(kc)
-        q = qknorm_rope_kvwrite(qkv, wq, wk, cos, sin, pos, kc[:M], vc[:M], 1e-6, nH, nKV, D)
+        q = qknorm_rope_kvwrite(qkv, wq, wk, cos, sin, pos_b, kc[:B], vc[:B], 1e-6, nH, nKV, D, QL=QL)
         q_ref, k_ref, v_ref = reference(qkv, wq, wk, cos, sin, pos, nH, nKV, D, 1e-6)
-        rows = torch.arange(M, device=device)
+        rows = torch.arange(B, device=device).repeat_interleave(QL)
         k_got = kc[rows, :, pos]  # [M, nKV, D]
         v_got = vc[rows, :, pos]
         for name, got, want in (("q", q, q_ref), ("k", k_got, k_ref), ("v", v_got, v_ref)):
             diff = (got.float() - want.float()).abs().max().item()
             tol = 2 * 2**-8 * want.float().abs().max().item()
-            assert diff <= tol, f"{name} mismatch M={M} D={D}: max diff {diff} > {tol}"
+            assert diff <= tol, f"{name} mismatch B={B} QL={QL}: max diff {diff} > {tol}"
         # nothing else in the cache was touched
         kc[rows, :, pos] = 0
         vc[rows, :, pos] = 0

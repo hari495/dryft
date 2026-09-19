@@ -263,3 +263,145 @@ class Model:
         state.next_ids[:Bb].copy_(nxt)
         state.ids[:Bb].copy_(nxt)
         state.seq_lens[:Bb].add_(1)
+
+    # ------------------------------------------------------- speculative step
+    @torch.no_grad()
+    def verify_step(self, state: DecodeState, Bb: int, Lb: int, QL: int) -> None:
+        """One speculative step for rows ``[0, Bb)``: verify the chain
+        ``tok_in[b] = [current token, K = QL-1 drafts]`` in a single forward,
+        accept the longest drafted prefix that equals the model's own argmax,
+        add the model's next token, then draft the next chain from the token
+        history (prompt lookup) — all on device, so the call is graph-capturable
+        and the loop never waits on the host.
+
+        Reads ``tok_in``, ``seq_lens``, ``produced``, ``max_new``, ``hist``;
+        writes ``out_step`` (new tokens, ``-1`` where none), ``n_new``, and
+        advances ``seq_lens``, ``produced``, ``ids``, ``hist``, ``tok_in``.
+        Rows that already produced ``max_new`` tokens are frozen. Every emitted
+        token is the greedy choice on its own prefix: drafts are only ever
+        accepted when they equal the argmax, so their content never affects
+        correctness — only speed.
+        """
+        cfg = self.cfg
+        Hq, Hkv, D, nH, nKV, G = cfg.q_dim, cfg.kv_dim, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads, cfg.group
+        K = QL - 1
+        M = Bb * QL
+        pos = state.seq_lens[:Bb]
+        tok_in = state.tok_in[:Bb, :QL]
+        layers = self.w.layers
+        eps = cfg.eps
+        tri_rms, tri_rope, tri_attn = self._k_rms, self._k_rope, self._k_attn
+        norm = tri_rms.rmsnorm if tri_rms is not None else rmsnorm
+        silu_mul = self._k_silu.silu_mul if self._k_silu is not None else _silu_mul
+
+        def add_norm(res: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if tri_rms is not None:
+                return tri_rms.add_rmsnorm(res, y, w, eps)
+            r = res + y
+            return r, rmsnorm(r, w, eps)
+
+        jj = torch.arange(QL, device=pos.device, dtype=torch.int64)
+        x = F.embedding(tok_in.reshape(-1), self.w.embed)  # [M, H]
+        h = norm(x, layers[0].w_in, eps)
+        if tri_rope is None or tri_attn is None:
+            pos_rows = (pos[:, None] + jj[None, :]).reshape(-1)  # [M] position of every chain row
+        if tri_rope is None:
+            cos = state.cos[pos_rows][:, None, :]  # [M, 1, D]
+            sin = state.sin[pos_rows][:, None, :]
+            row_i = state.row_idx[:Bb].repeat_interleave(QL)[:, None]
+            head_i = state.head_idx[None, :]
+            pos_i = pos_rows[:, None]
+        if tri_attn is None:
+            # row (b, j) sees keys <= pos[b] + j; query rows ordered (j, g) per kv head
+            Lk = min(Lb + QL, state.l_cap)
+            key_ok = state.pos_range[:Lk][None, None, :] <= (pos[:, None] + jj[None, :])[:, :, None]  # [Bb, QL, Lk]
+            mask = key_ok.repeat_interleave(G, dim=1)[:, None, :, :]  # [Bb, 1, QL*G, Lk]
+        for li, L in enumerate(layers):
+            qkv = F.linear(h, L.w_qkv)  # [M, Hq + 2 Hkv]
+            if tri_rope is not None:
+                q = tri_rope.qknorm_rope_kvwrite(
+                    qkv, L.w_qn, L.w_kn, state.cos, state.sin, pos,
+                    state.k_cache[li], state.v_cache[li], eps, nH, nKV, D, QL=QL,
+                )
+            else:
+                q = norm(qkv[:, :Hq].view(M, nH, D), L.w_qn, eps)
+                k = norm(qkv[:, Hq : Hq + Hkv].view(M, nKV, D), L.w_kn, eps)
+                v = qkv[:, Hq + Hkv :].view(M, nKV, D)
+                q = rope(q, cos, sin)
+                k = rope(k, cos, sin)
+                state.k_cache[li, row_i, head_i, pos_i] = k
+                state.v_cache[li, row_i, head_i, pos_i] = v
+            if tri_attn is not None:
+                o = tri_attn.attn_decode(
+                    q, state.k_cache[li], state.v_cache[li], state.seq_lens, Bb, Lb, self.scale, QL=QL
+                )
+            else:
+                kc = state.k_cache[li, :Bb, :, :Lk]  # [Bb, nKV, Lk, D]
+                vc = state.v_cache[li, :Bb, :, :Lk]
+                qg = q.view(Bb, QL, nKV, G, D).permute(0, 2, 1, 3, 4).reshape(Bb, nKV, QL * G, D)
+                og = F.scaled_dot_product_attention(qg, kc, vc, attn_mask=mask, scale=self.scale)
+                o = og.view(Bb, nKV, QL, G, D).permute(0, 2, 1, 3, 4).reshape(M, nH, D)
+            x, h = add_norm(x, F.linear(o.reshape(M, Hq), L.w_o), L.w_post)
+            w_next = layers[li + 1].w_in if li + 1 < len(layers) else self.w.norm
+            x, h = add_norm(x, F.linear(silu_mul(F.linear(h, L.w_gu)), L.w_down), w_next)
+        logits = F.linear(h, self.w.lm_head)  # [M, V] bf16
+        pred = logits.argmax(dim=-1).view(Bb, QL)  # pred[:, j] = greedy token after tok_in[:, :j+1]
+
+        # --- acceptance: longest drafted prefix equal to the model's own argmax
+        if K > 0:
+            match = (tok_in[:, 1:] == pred[:, :-1]).to(torch.int64)  # [Bb, K]
+            n_acc = torch.cumprod(match, dim=1).sum(dim=1)  # [Bb] in 0..K
+        else:
+            n_acc = torch.zeros_like(pos)
+        active = state.produced[:Bb] < state.max_new
+        n_new = torch.where(active, n_acc + 1, torch.zeros_like(n_acc))
+        bonus = pred.gather(1, n_acc[:, None])  # [Bb, 1] model's token after the accepted prefix
+        cand = torch.cat([tok_in[:, 1:], bonus], dim=1)  # cand[:, j] = tok_in[:, j+1] (j<K), bonus (j=K)
+        out = torch.where(jj[None, :] < n_acc[:, None], cand, bonus.expand(Bb, QL))
+        out = torch.where((jj[None, :] <= n_acc[:, None]) & active[:, None], out, torch.full_like(out, -1))
+        state.out_step[:Bb, :QL].copy_(out)
+        state.n_new[:Bb].copy_(n_new)
+
+        # --- state advance (frozen rows keep their position and token)
+        new_pos = pos + n_new
+        new_ids = torch.where(active, bonus[:, 0], state.ids[:Bb])
+        hist = state.hist[:Bb]
+        scratch = state.l_cap  # positions >= l_cap are a write-only scratch tail
+        slots = torch.where(out >= 0, pos[:, None] + 1 + jj[None, :], scratch + jj[None, :])
+        hist.scatter_(1, slots, torch.where(out >= 0, out, torch.zeros_like(out)))
+        state.seq_lens[:Bb].copy_(new_pos)
+        state.produced[:Bb].add_(n_new)
+        state.ids[:Bb].copy_(new_ids)
+
+        self.draft(state, Bb, Lb, QL)
+
+    @torch.no_grad()
+    def draft(self, state: DecodeState, Bb: int, Lb: int, QL: int) -> None:
+        """Prompt lookup: ``tok_in[b] = [ids[b], K drafts]`` where the drafts
+        continue the latest earlier occurrence of the last 3-gram (else 2-gram)
+        of ``hist[b, :seq_lens[b]+1]``. No match -> stale tokens, which are
+        merely never accepted."""
+        K = QL - 1
+        hist = state.hist[:Bb]
+        state.tok_in[:Bb, 0].copy_(state.ids[:Bb])
+        if K <= 0:
+            return
+        P = state.seq_lens[:Bb]  # position of the current token (already in hist)
+        jj = state.pos_range[:K][None, :]
+        ar = state.pos_range[:Lb][None, :]  # candidate n-gram starts
+        h0, h1, h2 = hist[:, :Lb], hist[:, 1 : Lb + 1], hist[:, 2 : Lb + 2]
+        g2 = hist.gather(1, P[:, None])
+        g1 = hist.gather(1, (P - 1).clamp(min=0)[:, None])
+        g0 = hist.gather(1, (P - 2).clamp(min=0)[:, None])
+        eq3 = (h0 == g0) & (h1 == g1) & (h2 == g2) & (ar <= (P - 3)[:, None])
+        eq2 = (h0 == g1) & (h1 == g2) & (ar <= (P - 2)[:, None])
+        i3 = (eq3.to(torch.int64) * (ar + 1)).argmax(dim=1)  # latest match start (0 if none)
+        i2 = (eq2.to(torch.int64) * (ar + 1)).argmax(dim=1)
+        start = torch.where(eq3.any(dim=1), i3 + 3, torch.where(eq2.any(dim=1), i2 + 2, P + 1))
+        # A continuation that runs past the last known token repeats the period
+        # between the match and now (the hypothesis behind the draft anyway).
+        q = start[:, None] + jj  # [Bb, K]
+        period = (P + 1 - start).clamp(min=1)[:, None]
+        over = (q - P[:, None]).clamp(min=0)
+        q = q - ((over + period - 1) // period) * period
+        state.tok_in[:Bb, 1:QL].copy_(hist.gather(1, q.clamp(min=0, max=hist.shape[1] - 1)))
