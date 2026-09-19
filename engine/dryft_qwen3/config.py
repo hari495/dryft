@@ -30,10 +30,11 @@ FLAGS: dict[str, bool] = {
     "PREFILL_ENABLE_GQA": False,
     # Triton kernels (Tier 2/3). Each enabled kernel selftests on the GPU in
     # Model.__init__ and silently falls back to the torch path if it fails.
-    # R1 (2026-09-19): fused residual+RMSNorm on, decode and prefill.
+    # R1 (2026-09-19): fused residual+RMSNorm on, decode and prefill -> 524.
+    # R2: fused qk-norm+RoPE+KV-write and split-KV decode attention on.
     "TRITON_RMSNORM": True,
-    "TRITON_ROPE": False,
-    "TRITON_ATTN_DECODE": False,
+    "TRITON_ROPE": True,
+    "TRITON_ATTN_DECODE": True,
 }
 
 

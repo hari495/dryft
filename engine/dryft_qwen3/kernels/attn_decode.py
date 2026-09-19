@@ -13,8 +13,8 @@ Numerics: scores fp32 (bf16 x bf16 products, fp32 accumulate), online
 softmax fp32, P rounded to bf16 for the PV dot (as flash attention does),
 fp32 accumulation, one bf16 rounding at the end.
 
-STATUS: written without hardware access; FLAGS["TRITON_ATTN_DECODE"] stays
-off until ``selftest()`` passes on an H100.
+STATUS: enabled (R2); selftest runs in Model.__init__ on the target GPU and
+the torch path is used if it fails.
 """
 
 from __future__ import annotations
@@ -173,13 +173,15 @@ def reference(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, seq
 
 def selftest(device: str = "cuda") -> None:
     torch.manual_seed(0)
+    # Production constexpr set only (G=4, NH=32, D=128): every extra set is a
+    # compile at load time. Odd lengths and length 1 cover the masking.
     for (B, nH, nKV, D, Lcap, Lb, lens) in (
         (1, 32, 8, 128, 1024, 1024, [0]),
         (1, 32, 8, 128, 1024, 1024, [512]),
         (1, 32, 8, 128, 1024, 1024, [1023]),
         (4, 32, 8, 128, 2048, 2048, [1, 513, 2047, 64]),
         (16, 32, 8, 128, 512, 512, list(range(3, 3 + 16 * 31, 31))),
-        (3, 4, 2, 16, 64, 64, [0, 17, 63]),
+        (2, 32, 8, 128, 8192, 8192, [8191, 4096]),
     ):
         q = torch.randn(B, nH, D, device=device).to(torch.bfloat16)
         kc = torch.randn(B + 1, nKV, Lcap, D, device=device).to(torch.bfloat16)

@@ -12,8 +12,8 @@ Numerics mirror HF exactly, including bf16 rounding between every op:
 with ``cos``/``sin`` the bf16 tables ``[L, D]`` (``cat(freqs, freqs)`` so the
 two halves are equal; only the first ``D/2`` columns are read).
 
-STATUS: written without hardware access; FLAGS["TRITON_ROPE"] stays off
-until ``selftest()`` passes on an H100.
+STATUS: enabled (R2); selftest runs in Model.__init__ on the target GPU and
+the torch path is used if it fails.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ def reference(qkv, wq, wk, cos, sin, pos, nH, nKV, D, eps):
 
 def selftest(device: str = "cuda") -> None:
     torch.manual_seed(0)
-    for (M, nH, nKV, D, Lcap) in ((1, 32, 8, 128, 512), (16, 32, 8, 128, 2048), (3, 4, 2, 16, 64)):
+    for (M, nH, nKV, D, Lcap) in ((1, 32, 8, 128, 512), (16, 32, 8, 128, 2048), (32, 32, 8, 128, 8192)):  # production constexpr set only
         qkv = (torch.randn(M, (nH + 2 * nKV) * D, device=device) * 2).to(torch.bfloat16)
         wq = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)
         wk = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)

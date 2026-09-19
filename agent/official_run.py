@@ -121,7 +121,9 @@ def report(run: dict, public_shapes: list[dict]) -> int:
         "run_id": run.get("id"),
         "commit": (run.get("commitSha") or "")[:10],
         "state": state,
-        "failure": result.get("failureCode") or run.get("errorCode") or "none",
+        "attempt": run.get("attempt"),
+        # errorCode can linger from a retried attempt while the result is valid
+        "failure": result.get("failureCode") or ("none" if state == "succeeded" else run.get("errorCode") or "none"),
     }
     shapes = result.get("shapes") or []
     ttft_ratio = tpot_ratio = spread = mem = 0.0
@@ -167,7 +169,8 @@ def report(run: dict, public_shapes: list[dict]) -> int:
     if result.get("failureMessage"):
         print(f"[official_run] failure: {result['failureMessage']}", file=sys.stderr)
     if run.get("errorMessage"):
-        print(f"[official_run] error: {run['errorMessage']}", file=sys.stderr)
+        kind = "note (earlier attempt)" if state == "succeeded" else "error"
+        print(f"[official_run] {kind}: {run['errorMessage']}", file=sys.stderr)
     return 0 if (state == "succeeded" and score is not None) else 1
 
 
