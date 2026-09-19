@@ -5,7 +5,7 @@ Calibration table (local vs official). Fill the official columns from
 
 | date | commit | local geomean | official geomean | hidden per-workload | notes |
 |------|--------|--------------:|-----------------:|---------------------|-------|
-| 2026-09-19 | (uncommitted) | n/a (no local GPU) | not run | – | Tier 1 torch engine; verified on tiny CPU model only |
+| 2026-09-19 | 0fb3a60 | n/a (no local GPU) | **405.0** (native=100) | hidden not shown; public: b1 104 tok/s, b4 206, b16 1337 | T1 torch path, graphs+pipeline; all gates pass; leaders 633/624 |
 
 Environment note: the development machine is an Apple M4 Pro (no CUDA, no
 triton wheel). Everything below marked **CPU-verified** was checked against
@@ -67,3 +67,31 @@ risk: first-run compile/launch errors in Triton 3.1 syntax; check
 shrunk and retired buffers are kept alive so captured graphs stay valid.
 next: on GPU — `verify.py --kernels`, then enable one flag, `verify.py --all`,
 `bench.py --public --extra`, record here.
+
+### 2026-09-19  [official run d2b0b294] commit 0fb3a60                          RESULT
+flags: CUDA_GRAPHS=1 PIPELINE=1 TRITON_*=0
+score: 405.0 (geomean over 6 hidden workloads, native = 100). Leaderboard top: 633, 624, then ~300.
+public (ours vs native, 5 samples each):
+  b1x512x32    104 tok/s  total 306 ms (ref 805)   TTFT 22/28 ms = 0.81x   TPOT  9.14/25.1 ms = 0.36x  spread 0.1%
+  b4x2048x32   206 tok/s  total 620 ms (ref 1040)  TTFT 213/201 ms = 1.05x TPOT 13.17/27.0 ms = 0.48x  spread 0.5%
+  b16x512x128 1337 tok/s  total 1530 ms (ref 3930) TTFT 202/192 ms = 1.05x TPOT 10.45/29.3 ms = 0.35x  spread 0.3%
+peak memory 49.2 GiB (52.83 GB) on all three -> within the 64 GB self-budget.
+H100 80GB HBM3, driver 580.95, harness 0.2.0, gVisor.
+reading:
+  * Correct on all 9 workloads; graphs evidently captured (TPOT 9 ms at b1 is
+    not achievable with ~1800 eager launches/step). Engine stderr is hidden on
+    official runs; a public run of the same submission is queued for the log.
+  * TPOT 9.1 ms at b1 = 0.88 TB/s achieved. Floor is 2.4 ms. We are
+    launch/fusion-bound (Tier 2/3), exactly as §4 predicts for an unfused
+    torch step. Tier 2 kernels are the next lever: expect 2-3x on TPOT.
+  * TTFT is the gate closest to failing: 1.05x on b4x2048 and b16x512 (limit
+    1.10). Prefill overhead vs HF: repeat_interleave K/V copies per layer
+    (32-head materialisation), cache writes, fused-GEMM shapes. Also the first
+    decode step is launched *before* the first yield. Fix: yield token 0
+    before launching step 1 (costs one idle gap, ~0 TPOT), try
+    PREFILL_ENABLE_GQA=1 (no K/V copy) and measure TTFT on b4x2048.
+  * TPOT ratios 0.35-0.48x leave huge headroom; spread <1%.
+next: (1) TTFT hygiene above; (2) verify.py --kernels on GPU is impossible from
+here -> enable TRITON_RMSNORM alone in one push and read the result (a wrong
+kernel fails correctness; a broken launch fails init); (3) then TRITON_ROPE,
+TRITON_ATTN_DECODE.

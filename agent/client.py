@@ -105,6 +105,11 @@ class Dryft:
     def run(self, run_id: str) -> dict:
         return self._send("GET", f"/api/v1/runs/{run_id}")["run"]
 
+    def runs(self, limit: int = 25) -> list[dict]:
+        """The team's most recent runs, newest first."""
+        query = urllib.parse.urlencode({"limit": limit})
+        return self._send("GET", f"/api/v1/runs?{query}").get("items") or []
+
     def logs(self, run_id: str, after: int = -1, limit: int = 200) -> dict:
         query = urllib.parse.urlencode({"after": after, "limit": limit})
         return self._send("GET", f"/api/v1/runs/{run_id}/logs?{query}")
