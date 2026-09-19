@@ -31,6 +31,11 @@ class Engine:
         t0 = time.time()
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+            # Keep SDPA on flash (prefill) / mem-efficient + math (masked decode):
+            # the cuDNN backend is the one most likely to misbehave under graph
+            # capture, and it is not needed for either shape.
+            torch.backends.cuda.enable_cudnn_sdp(False)
         self.settings = config.SETTINGS
         self.device = config.device()
         self.cuda = self.device.type == "cuda"
