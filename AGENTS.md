@@ -67,7 +67,9 @@ Appendix B. Reading list
 
 - Score per workload = `batch × output_tokens / median_wall_seconds`
   over 5 samples, **including prefill**. Leaderboard = geometric mean
-  over 3 hidden workloads (100, 200, 400 tok/s → 200). A 2× gain
+  over the hidden workloads (100, 200, 400 tok/s → 200). The published
+  challenge definition (`./bin/dryft challenges`) lists **nine**
+  workloads: 3 public + 6 hidden. A 2× gain
   anywhere is worth the same; don't specialize for one batch size.
 - Gates (all must pass, per workload, else the workload fails):
   TTFT ≤ 1.10× baseline; TPOT ≤ 1.10× baseline; timing spread across
@@ -275,6 +277,11 @@ python agent/tune.py --all                       # regenerate engine/tuned/*.jso
 ./bin/dryft validate engine                      # server lint, locally
 ./bin/dryft run <SUBMISSION_ID> --wait 3000      # rerun a submission
 ```
+Platform facts (2026-09-19): the API moved to `https://htn.dryft.ai`
+(export `DRYFT_API=https://htn.dryft.ai` for CLI 0.1.0). CLI upload
+(`dryft submit`) returns 405 — submissions are created only from a repo
+connected at https://htn.dryft.ai/repos (GitHub App; engine folder
+`engine`); a push to the connected branch starts a *public* run.
 Local dev environment: `uv venv --python 3.11 .venv && uv pip install
 --python .venv/bin/python torch==2.5.1 transformers==4.51.3
 safetensors==0.5.3 tokenizers==0.21.1 "numpy<2.2"`; run the commands above
