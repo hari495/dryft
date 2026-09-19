@@ -1,9 +1,16 @@
 """Fused per-head q/k RMSNorm + RoPE + KV-cache write (Tier 2.2), in Triton.
 
 One program per (row, head). Heads ``[0, nH)`` are query heads: norm, rotate,
-write to ``q_out[row, h, :]``. Heads ``[nH, nH+nKV)`` are kv heads: norm +
-rotate k and write it to ``k_cache[row, kvh, pos[row], :]``; copy v to
-``v_cache`` unchanged.
+write to ``q_out``. Heads ``[nH, nH+nKV)`` are kv heads: norm + rotate k and
+write it to ``k_cache[brow, kvh, pos, :]``; copy v to ``v_cache`` unchanged.
+
+Two row mappings share the kernel:
+  * decode  (``T == 0``): row ``m`` is batch row ``m`` at position ``pos[m]``;
+    ``q_out`` is ``[M, nH, D]``.
+  * prefill (``T > 0``):  row ``m`` is batch row ``m // T`` at position
+    ``m % T``; ``q_out`` is ``[B, nH, T, D]`` (the layout SDPA wants), and the
+    K/V written into the cache are read back by attention as ``[B, nKV, T, D]``
+    views — no separate transpose/copy/cache-write kernels.
 
 Numerics mirror HF exactly, including bf16 rounding between every op:
     n  = bf16( bf16(x_f32 * rsqrt(mean(x^2) + eps)) * w )          # Qwen3RMSNorm
@@ -12,8 +19,8 @@ Numerics mirror HF exactly, including bf16 rounding between every op:
 with ``cos``/``sin`` the bf16 tables ``[L, D]`` (``cat(freqs, freqs)`` so the
 two halves are equal; only the first ``D/2`` columns are read).
 
-STATUS: enabled (R2); selftest runs in Model.__init__ on the target GPU and
-the torch path is used if it fails.
+STATUS: enabled (R2 decode, R3 prefill); selftest runs in Model.__init__ on
+the target GPU and the torch path is used if it fails.
 """
 
 from __future__ import annotations
@@ -45,18 +52,24 @@ def _qknorm_rope_kv_kernel(
     qkv_ptr, wq_ptr, wk_ptr, cos_ptr, sin_ptr, pos_ptr,
     q_out_ptr, k_cache_ptr, v_cache_ptr,
     stride_qkv_row,
+    stride_qo_b, stride_qo_h, stride_qo_t,
     stride_kc_b, stride_kc_h, stride_kc_l,
     stride_vc_b, stride_vc_h, stride_vc_l,
-    eps,
-    NH: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr,
+    eps, T,
+    NH: tl.constexpr, NKV: tl.constexpr, D: tl.constexpr, PREFILL: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     d = tl.arange(0, D // 2)
-    pos = tl.load(pos_ptr + row).to(tl.int64)
+    if PREFILL:
+        brow = row // T
+        pos = row % T
+    else:
+        brow = row
+        pos = tl.load(pos_ptr + row).to(tl.int64)
     c = tl.load(cos_ptr + pos * D + d).to(tl.float32)
     s = tl.load(sin_ptr + pos * D + d).to(tl.float32)
-    base = qkv_ptr + row.to(tl.int64) * stride_qkv_row
+    base = qkv_ptr + row * stride_qkv_row
     if head < NH:
         src = base + head * D
         x1 = tl.load(src + d).to(tl.float32)
@@ -64,7 +77,7 @@ def _qknorm_rope_kv_kernel(
         w1 = tl.load(wq_ptr + d).to(tl.float32)
         w2 = tl.load(wq_ptr + D // 2 + d).to(tl.float32)
         o1, o2 = _norm_rope(x1, x2, w1, w2, c, s, eps, D)
-        dst = q_out_ptr + (row.to(tl.int64) * NH + head) * D
+        dst = q_out_ptr + brow * stride_qo_b + head * stride_qo_h + pos * stride_qo_t
         tl.store(dst + d, o1.to(tl.bfloat16))
         tl.store(dst + D // 2 + d, o2.to(tl.bfloat16))
     else:
@@ -75,13 +88,13 @@ def _qknorm_rope_kv_kernel(
         w1 = tl.load(wk_ptr + d).to(tl.float32)
         w2 = tl.load(wk_ptr + D // 2 + d).to(tl.float32)
         o1, o2 = _norm_rope(x1, x2, w1, w2, c, s, eps, D)
-        kdst = k_cache_ptr + row.to(tl.int64) * stride_kc_b + kvh * stride_kc_h + pos * stride_kc_l
+        kdst = k_cache_ptr + brow * stride_kc_b + kvh * stride_kc_h + pos * stride_kc_l
         tl.store(kdst + d, o1.to(tl.bfloat16))
         tl.store(kdst + D // 2 + d, o2.to(tl.bfloat16))
         vsrc = base + NH * D + NKV * D + kvh * D
         v1 = tl.load(vsrc + d)
         v2 = tl.load(vsrc + D // 2 + d)
-        vdst = v_cache_ptr + row.to(tl.int64) * stride_vc_b + kvh * stride_vc_h + pos * stride_vc_l
+        vdst = v_cache_ptr + brow * stride_vc_b + kvh * stride_vc_h + pos * stride_vc_l
         tl.store(vdst + d, v1)
         tl.store(vdst + D // 2 + d, v2)
 
@@ -90,9 +103,9 @@ def qknorm_rope_kvwrite(
     qkv: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
     pos: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, eps: float, nH: int, nKV: int, D: int,
 ) -> torch.Tensor:
-    """qkv ``[M, (nH+2nKV)*D]`` bf16; pos int64 ``[M]``; k/v_cache ``[B_cap, nKV, L_cap, D]``
-    (any strides, D contiguous). Returns rotated q ``[M, nH, D]`` bf16 and
-    writes k/v for row ``m`` at ``[m, :, pos[m], :]``."""
+    """Decode: qkv ``[M, (nH+2nKV)*D]`` bf16; pos int64 ``[M]``; k/v_cache
+    ``[B_cap, nKV, L_cap, D]`` (any strides, D contiguous). Returns rotated q
+    ``[M, nH, D]`` bf16 and writes k/v for row ``m`` at ``[m, :, pos[m], :]``."""
     M = qkv.shape[0]
     assert qkv.stride(1) == 1 and cos.is_contiguous() and sin.is_contiguous()
     assert k_cache.stride(3) == 1 and v_cache.stride(3) == 1
@@ -100,9 +113,33 @@ def qknorm_rope_kvwrite(
     _qknorm_rope_kv_kernel[(M, nH + nKV)](
         qkv, wq, wk, cos, sin, pos, q_out, k_cache, v_cache,
         qkv.stride(0),
+        q_out.stride(0), q_out.stride(1), 0,
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
         v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
-        eps, NH=nH, NKV=nKV, D=D, num_warps=1,
+        eps, 0, NH=nH, NKV=nKV, D=D, PREFILL=False, num_warps=1,
+    )
+    return q_out
+
+
+def qknorm_rope_kvwrite_prefill(
+    qkv: torch.Tensor, wq: torch.Tensor, wk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+    k_cache: torch.Tensor, v_cache: torch.Tensor, eps: float, nH: int, nKV: int, D: int,
+) -> torch.Tensor:
+    """Prefill: qkv ``[B, T, (nH+2nKV)*D]`` bf16 (positions ``0..T-1``);
+    k/v_cache ``[B_cap, nKV, L_cap, D]``. Returns q ``[B, nH, T, D]`` bf16 and
+    writes k/v for batch row ``b`` at ``[b, :, 0:T, :]``."""
+    B, T, _ = qkv.shape
+    assert qkv.stride(2) == 1 and cos.is_contiguous() and sin.is_contiguous()
+    assert k_cache.stride(3) == 1 and v_cache.stride(3) == 1
+    qkv2 = qkv.reshape(B * T, -1)
+    q_out = torch.empty((B, nH, T, D), dtype=torch.bfloat16, device=qkv.device)
+    _qknorm_rope_kv_kernel[(B * T, nH + nKV)](
+        qkv2, wq, wk, cos, sin, cos, q_out, k_cache, v_cache,
+        qkv2.stride(0),
+        q_out.stride(0), q_out.stride(1), q_out.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        eps, T, NH=nH, NKV=nKV, D=D, PREFILL=True, num_warps=1,
     )
     return q_out
 
@@ -155,3 +192,28 @@ def selftest(device: str = "cuda") -> None:
         kc[rows, :, pos] = 0
         vc[rows, :, pos] = 0
         assert not kc.any() and not vc.any(), "kernel wrote outside its slot"
+    # prefill mapping: rows are (b, t) with t = 0..T-1; q comes out [B, nH, T, D]
+    nH, nKV, D = 32, 8, 128
+    inv = 1.0 / (5e6 ** (torch.arange(0, D, 2, device=device).float() / D))
+    for B, T, Lcap in ((2, 37, 64), (1, 512, 1024), (3, 2048, 2048)):
+        fr = torch.arange(Lcap, device=device).float()[:, None] * inv[None]
+        emb = torch.cat((fr, fr), -1)
+        cos, sin = emb.cos().to(torch.bfloat16), emb.sin().to(torch.bfloat16)
+        qkv = (torch.randn(B, T, (nH + 2 * nKV) * D, device=device) * 2).to(torch.bfloat16)
+        wq = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)
+        wk = (1 + 0.1 * torch.randn(D, device=device)).to(torch.bfloat16)
+        kc = torch.zeros((B + 1, nKV, Lcap, D), dtype=torch.bfloat16, device=device)
+        vc = torch.zeros_like(kc)
+        q = qknorm_rope_kvwrite_prefill(qkv, wq, wk, cos, sin, kc[:B], vc[:B], 1e-6, nH, nKV, D)
+        pos = torch.arange(T, device=device).repeat(B)
+        q_ref, k_ref, v_ref = reference(qkv.reshape(B * T, -1), wq, wk, cos, sin, pos, nH, nKV, D, 1e-6)
+        q_ref = q_ref.view(B, T, nH, D).transpose(1, 2)
+        k_got = kc[:B, :, :T].transpose(1, 2).reshape(B * T, nKV, D)
+        v_got = vc[:B, :, :T].transpose(1, 2).reshape(B * T, nKV, D)
+        for name, got, want in (("q", q, q_ref), ("k", k_got, k_ref), ("v", v_got, v_ref)):
+            diff = (got.float() - want.float()).abs().max().item()
+            tol = 2 * 2**-8 * want.float().abs().max().item()
+            assert diff <= tol, f"prefill {name} mismatch B={B} T={T}: max diff {diff} > {tol}"
+        kc[:B, :, :T] = 0
+        vc[:B, :, :T] = 0
+        assert not kc.any() and not vc.any(), "prefill kernel wrote outside its slot"

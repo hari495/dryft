@@ -25,16 +25,19 @@ FLAGS: dict[str, bool] = {
     # Keep one decode step in flight; D2H copies land in a pinned ring and the
     # host waits on an event for step t-1 only.
     "PIPELINE": True,
-    # Prefill: pass enable_gqa=True to SDPA instead of materialising 32 K/V
-    # heads. Off = bit-identical to the HF path.
-    "PREFILL_ENABLE_GQA": False,
+    # Prefill: pass enable_gqa=True to SDPA (flash backend, K/V read straight
+    # from the cache views) instead of materialising 32 K/V heads. Model.__init__
+    # probes that flash really takes the GQA call and otherwise repeats K/V.
+    "PREFILL_ENABLE_GQA": True,
     # Triton kernels (Tier 2/3). Each enabled kernel selftests on the GPU in
     # Model.__init__ and silently falls back to the torch path if it fails.
     # R1 (2026-09-19): fused residual+RMSNorm on, decode and prefill -> 524.
-    # R2: fused qk-norm+RoPE+KV-write and split-KV decode attention on.
+    # R2: fused qk-norm+RoPE+KV-write and split-KV decode attention on -> 793.
+    # R3: rope kernel in prefill too, fused silu*mul, flash GQA prefill.
     "TRITON_RMSNORM": True,
     "TRITON_ROPE": True,
     "TRITON_ATTN_DECODE": True,
+    "TRITON_SILU_MUL": True,
 }
 
 

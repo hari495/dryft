@@ -41,6 +41,11 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     return (x * cos) + (rotate_half(x) * sin)
 
 
+def _silu_mul(gu: torch.Tensor) -> torch.Tensor:
+    g, u = gu.split(gu.shape[-1] // 2, dim=-1)
+    return F.silu(g) * u
+
+
 def rope_tables(cfg: ModelConfig, length: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     """cos/sin ``[length, head_dim]`` in bf16, computed exactly like HF's
     default rope init + ``Qwen3RotaryEmbedding.forward`` (fp32, then cast)."""
@@ -68,6 +73,33 @@ class Model:
         self._k_rms = self._load_kernel("TRITON_RMSNORM", "rmsnorm")
         self._k_rope = self._load_kernel("TRITON_ROPE", "rope_qknorm")
         self._k_attn = self._load_kernel("TRITON_ATTN_DECODE", "attn_decode")
+        self._k_silu = self._load_kernel("TRITON_SILU_MUL", "silu_mul")
+        self.prefill_gqa = flag("PREFILL_ENABLE_GQA") and self._flash_gqa_works()
+
+    def _flash_gqa_works(self) -> bool:
+        """True iff SDPA runs GQA on the flash backend here (never the math
+        backend, which would materialise B*H*T*T scores at prefill)."""
+        if self.device.type != "cuda":
+            return False
+        try:
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            cfg = self.cfg
+            q = torch.randn(1, cfg.num_heads, 2048, cfg.head_dim, device=self.device, dtype=torch.bfloat16)
+            kv = torch.randn(1, cfg.num_kv_heads, 2, 4096, cfg.head_dim, device=self.device, dtype=torch.bfloat16)
+            k, v = kv[:, :, 0, :2048], kv[:, :, 1, :2048]  # strided like the cache views
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
+                o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale, enable_gqa=True)
+            k32 = torch.repeat_interleave(k, cfg.group, dim=1).contiguous()
+            v32 = torch.repeat_interleave(v, cfg.group, dim=1).contiguous()
+            ref = F.scaled_dot_product_attention(q, k32, v32, is_causal=True, scale=self.scale)
+            torch.cuda.synchronize(self.device)
+            ok = bool(torch.isfinite(o).all()) and (o.float() - ref.float()).abs().max().item() <= 2 * 2**-8 * ref.float().abs().max().item()
+        except Exception as exc:  # noqa: BLE001 - any failure means "repeat K/V"
+            log(f"prefill: flash GQA unavailable ({exc!r}); using repeat_interleave path")
+            return False
+        log(f"prefill: flash GQA {'ok' if ok else 'MISMATCH -> repeat_interleave path'}")
+        return ok
 
     def _load_kernel(self, flag_name: str, module_name: str):
         if not (self.triton and flag(flag_name)):
@@ -88,19 +120,26 @@ class Model:
 
     # ------------------------------------------------------------------ prefill
     @torch.no_grad()
-    def prefill(self, state: DecodeState, rows: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    def prefill(self, state: DecodeState, rows: torch.Tensor, ids: torch.Tensor, rows_are_prefix: bool = False) -> torch.Tensor:
         """Run ``ids`` ``[B, T]`` (equal lengths) through the model, write K/V
         into cache rows ``rows`` at positions ``0..T-1`` and return the greedy
-        next token ``[B]``. Does not touch ``state.seq_lens``."""
+        next token ``[B]``. Does not touch ``state.seq_lens``.
+        ``rows_are_prefix``: ``rows == 0..B-1`` (lets the fused rope kernel
+        address the cache directly)."""
         cfg = self.cfg
         B, T = ids.shape
         Hq, Hkv, D, nH, nKV, I = cfg.q_dim, cfg.kv_dim, cfg.head_dim, cfg.num_heads, cfg.num_kv_heads, cfg.intermediate
         x = F.embedding(ids, self.w.embed)  # [B, T, H]
-        cos = state.cos[:T][None, None]  # [1, 1, T, D]
-        sin = state.sin[:T][None, None]
-        use_gqa = flag("PREFILL_ENABLE_GQA")
-        tri_rms = self._k_rms
+        use_gqa = self.prefill_gqa
+        tri_rms, tri_rope, tri_silu = self._k_rms, self._k_rope, self._k_silu
         norm = tri_rms.rmsnorm if tri_rms is not None else rmsnorm
+        silu_mul = tri_silu.silu_mul if tri_silu is not None else _silu_mul
+        # The fused rope kernel maps row m -> (m // T, m % T): only valid when
+        # the cache rows are 0..B-1 in order.
+        fused_rope = tri_rope is not None and rows_are_prefix and T <= state.cos.shape[0]
+        if not fused_rope:
+            cos = state.cos[:T][None, None]  # [1, 1, T, D]
+            sin = state.sin[:T][None, None]
 
         def add_norm(res: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             if tri_rms is not None:
@@ -112,31 +151,33 @@ class Model:
         h = norm(x, layers[0].w_in, cfg.eps)
         for li, L in enumerate(layers):
             qkv = F.linear(h, L.w_qkv)  # [B, T, Hq + 2 Hkv]
-            q = qkv[..., :Hq].view(B, T, nH, D)
-            k = qkv[..., Hq : Hq + Hkv].view(B, T, nKV, D)
-            v = qkv[..., Hq + Hkv :].view(B, T, nKV, D)
-            q = norm(q, L.w_qn, cfg.eps).transpose(1, 2)  # [B, nH, T, D]
-            k = norm(k, L.w_kn, cfg.eps).transpose(1, 2)  # [B, nKV, T, D]
-            v = v.transpose(1, 2)
-            q = rope(q, cos, sin)
-            k = rope(k, cos, sin)
-            state.k_cache[li, rows, :, :T] = k
-            state.v_cache[li, rows, :, :T] = v
+            if fused_rope:
+                q = tri_rope.qknorm_rope_kvwrite_prefill(
+                    qkv, L.w_qn, L.w_kn, state.cos, state.sin,
+                    state.k_cache[li], state.v_cache[li], cfg.eps, nH, nKV, D,
+                )  # [B, nH, T, D]; K/V written into the cache
+                k = state.k_cache[li, :B, :, :T]  # [B, nKV, T, D] views, D contiguous
+                v = state.v_cache[li, :B, :, :T]
+            else:
+                q = qkv[..., :Hq].view(B, T, nH, D)
+                k = qkv[..., Hq : Hq + Hkv].view(B, T, nKV, D)
+                v = qkv[..., Hq + Hkv :].view(B, T, nKV, D)
+                q = norm(q, L.w_qn, cfg.eps).transpose(1, 2)  # [B, nH, T, D]
+                k = norm(k, L.w_kn, cfg.eps).transpose(1, 2)  # [B, nKV, T, D]
+                v = v.transpose(1, 2)
+                q = rope(q, cos, sin).contiguous()
+                k = rope(k, cos, sin)
+                state.k_cache[li, rows, :, :T] = k
+                state.v_cache[li, rows, :, :T] = v
             if use_gqa:
-                o = F.scaled_dot_product_attention(
-                    q.contiguous(), k.contiguous(), v.contiguous(), is_causal=True, scale=self.scale, enable_gqa=True
-                )
+                o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale, enable_gqa=True)
             else:
                 k32 = torch.repeat_interleave(k, cfg.group, dim=1)
                 v32 = torch.repeat_interleave(v, cfg.group, dim=1)
-                o = F.scaled_dot_product_attention(
-                    q.contiguous(), k32.contiguous(), v32.contiguous(), is_causal=True, scale=self.scale
-                )
+                o = F.scaled_dot_product_attention(q, k32, v32, is_causal=True, scale=self.scale)
             o = o.transpose(1, 2).reshape(B, T, Hq)
             x, h = add_norm(x, F.linear(o, L.w_o), L.w_post)
-            gu = F.linear(h, L.w_gu)
-            g, u = gu.split(I, dim=-1)
-            mlp = F.linear(F.silu(g) * u, L.w_down)
+            mlp = F.linear(silu_mul(F.linear(h, L.w_gu)), L.w_down)
             if li + 1 < len(layers):
                 x, h = add_norm(x, mlp, layers[li + 1].w_in)
             else:
@@ -172,6 +213,7 @@ class Model:
         eps = cfg.eps
         tri_rms, tri_rope, tri_attn = self._k_rms, self._k_rope, self._k_attn
         norm = tri_rms.rmsnorm if tri_rms is not None else rmsnorm
+        silu_mul = self._k_silu.silu_mul if self._k_silu is not None else _silu_mul
 
         def add_norm(res: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """(res + y, rmsnorm(res + y) * w): the residual add and the norm
@@ -214,10 +256,8 @@ class Model:
                 qg = q.view(Bb, nKV, G, D)  # q head h = kv*G + g  ==  h // G
                 o = F.scaled_dot_product_attention(qg, kc, vc, attn_mask=mask, scale=self.scale)
             x, h = add_norm(x, F.linear(o.reshape(Bb, Hq), L.w_o), L.w_post)
-            gu = F.linear(h, L.w_gu)
-            g, u = gu.split(I, dim=-1)
             w_next = layers[li + 1].w_in if li + 1 < len(layers) else self.w.norm
-            x, h = add_norm(x, F.linear(F.silu(g) * u, L.w_down), w_next)
+            x, h = add_norm(x, F.linear(silu_mul(F.linear(h, L.w_gu)), L.w_down), w_next)
         logits = F.linear(h, self.w.lm_head)  # h == final norm output; [Bb, V] bf16
         nxt = logits.argmax(dim=-1)
         state.next_ids[:Bb].copy_(nxt)

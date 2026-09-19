@@ -164,9 +164,9 @@ def kernel_tests() -> bool:
         print("kernels: no CUDA; skipping")
         return True
     ok = True
-    from dryft_qwen3.kernels import attn_decode, rmsnorm, rope_qknorm
+    from dryft_qwen3.kernels import attn_decode, rmsnorm, rope_qknorm, silu_mul
 
-    for mod in (rmsnorm, rope_qknorm, attn_decode):
+    for mod in (rmsnorm, rope_qknorm, attn_decode, silu_mul):
         t0 = time.time()
         try:
             mod.selftest()

@@ -152,7 +152,9 @@ class Engine:
                 ids = torch.tensor([input_ids[r] for r in rows_list], dtype=torch.int64, device=self.device)
                 if n == 0:
                     raise ValueError("empty prompt")
-                nxt = model.prefill(state, rows, ids)
+                # Fixed batches prefill rows 0..B-1 in order; the fused rope
+                # kernel relies on that mapping, ragged groups take the torch path.
+                nxt = model.prefill(state, rows, ids, rows_are_prefix=rows_list == list(range(len(rows_list))))
                 state.ids[rows] = nxt
                 state.seq_lens[rows] = n
 
